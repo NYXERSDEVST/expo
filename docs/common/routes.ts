@@ -12,6 +12,10 @@ import { PageApiVersionContextType } from '~/providers/page-api-version';
 import navigation from '~/public/static/constants/navigation.json';
 import { NavigationRoute, NavigationRouteWithSection } from '~/types/common';
 
+if (import.meta.webpackHot) {
+  import.meta.webpackHot.decline('~/public/static/constants/navigation.json');
+}
+
 export const getRoutes = (
   path: string,
   version: PageApiVersionContextType['version']
@@ -198,7 +202,7 @@ export function getBreadcrumbTrail(
           return true;
         }
       } else if (node.children) {
-        trail.push({ name: node.name, node });
+        trail.push({ name: node.sidebarTitle ?? node.name, node });
         if (search(node.children)) {
           return true;
         }

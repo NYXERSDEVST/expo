@@ -19,6 +19,347 @@ const optionsLoader = {
 
 const config = (products: object[]) => JSON.stringify({ products });
 
+const findModulesMock = jest.mocked(findModulesAsync) as jest.Mock;
+const createReactNativeConfigMock = jest.mocked(createReactNativeConfigAsync) as jest.Mock;
+
+const APP_ROOT = '/app';
+const PACKAGE_VERSION = '15.15.4';
+const VERSIONS = { reactNativeVersion: '0.87.1', hermesVersion: '250829098.0.17' };
+const VERSION_PREFIX = `${PACKAGE_VERSION}/${VERSIONS.reactNativeVersion}/${VERSIONS.hermesVersion}`;
+
+/** findExpoRepoRoot() resolves this from its own location, so a test that wants the
+ * monorepo candidates has to plant the marker it probes for. */
+const REPO_ROOT = path.resolve(__dirname, '../../../..');
+const MONOREPO_BASE = path.join(REPO_ROOT, 'packages/precompile/.build');
+const REPO_MARKER = path.join(REPO_ROOT, 'packages/expo-modules-core/spm.config.json');
+
+function mockInternalPackage(name: string, products: unknown[], { inRepo = false } = {}) {
+  const packageRoot = `${APP_ROOT}/node_modules/${name}`;
+  vol.fromJSON(
+    {
+      'package.json': JSON.stringify({ name }),
+      'spm.config.json': JSON.stringify({ products }),
+    },
+    packageRoot
+  );
+  if (inRepo) {
+    vol.fromJSON({ [REPO_MARKER]: '{}' });
+  }
+  findModulesMock.mockResolvedValue({ [name]: { path: packageRoot } });
+  return packageRoot;
+}
+
+/** Accumulates across calls so a test can install more than one external package. */
+let externalDependencies: Record<string, unknown> = {};
+
+function mockExternalPackage(
+  name: string,
+  products: unknown[],
+  { iosVersion, manifestVersion }: { iosVersion?: string; manifestVersion?: string } = {}
+) {
+  const packageRoot = `${APP_ROOT}/node_modules/${name}`;
+  vol.fromJSON({
+    [`${externalConfigsDir}/${name}/spm.config.json`]: JSON.stringify({ products }),
+    [`${packageRoot}/package.json`]: JSON.stringify({ name, version: manifestVersion }),
+  });
+  externalDependencies[name] = {
+    root: packageRoot,
+    name,
+    ...(iosVersion && { platforms: { ios: { version: iosVersion } } }),
+  };
+  createReactNativeConfigMock.mockResolvedValue({ dependencies: externalDependencies });
+  return packageRoot;
+}
+
+beforeEach(() => {
+  vol.reset();
+  // The resolver falls back to this variable, so an exported one would silently add a
+  // candidate base and turn the suite red on a machine set up for the pipeline.
+  delete process.env.EXPO_PRECOMPILED_MODULES_PATH;
+  externalDependencies = {};
+  findModulesMock.mockResolvedValue({});
+  createReactNativeConfigMock.mockResolvedValue({ dependencies: {} });
+});
+
+describe('resolvePrebuiltMetadataAsync artifact locator', () => {
+  it('locates an internal product and its shared SPM dependencies, without a version prefix', async () => {
+    const packageRoot = mockInternalPackage('expo-image', [
+      { name: 'ExpoImage', podName: 'ExpoImage', spmPackages: [{ productName: 'Lottie' }] },
+    ]);
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, { mode: 'app-plan' });
+
+    expect(document.ExpoImage?.artifact).toEqual({
+      bases: [`${packageRoot}/prebuilds/output`],
+      debug: {
+        dir: 'debug/xcframeworks',
+        framework: 'debug/xcframeworks/ExpoImage.xcframework',
+        tarball: 'debug/xcframeworks/ExpoImage.tar.gz',
+      },
+      release: {
+        dir: 'release/xcframeworks',
+        framework: 'release/xcframeworks/ExpoImage.xcframework',
+        tarball: 'release/xcframeworks/ExpoImage.tar.gz',
+      },
+      sharedSpmDeps: {
+        Lottie: {
+          bases: [`${packageRoot}/prebuilds/spm-deps/Lottie`],
+          debug: 'debug/Lottie.xcframework',
+          release: 'release/Lottie.xcframework',
+        },
+      },
+    });
+  });
+
+  it('describes an external product completely, under its own version prefix', async () => {
+    const packageRoot = mockExternalPackage(
+      'react-native-svg',
+      [{ name: 'RNSVG', podName: 'RNSVG', spmPackages: [{ productName: 'SVGNative' }] }],
+      { iosVersion: PACKAGE_VERSION }
+    );
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, {
+      mode: 'app-plan',
+      ...VERSIONS,
+    });
+
+    expect(document.RNSVG?.artifact).toEqual({
+      bases: [
+        `${packageRoot}/prebuilds/output/${VERSION_PREFIX}`,
+        `${packageRoot}/prebuilds/output`,
+      ],
+      debug: {
+        dir: 'debug/xcframeworks',
+        framework: 'debug/xcframeworks/RNSVG.xcframework',
+        tarball: 'debug/xcframeworks/RNSVG.tar.gz',
+        remoteKey: `react-native-svg/output/${VERSION_PREFIX}/debug/xcframeworks/RNSVG.tar.gz`,
+      },
+      release: {
+        dir: 'release/xcframeworks',
+        framework: 'release/xcframeworks/RNSVG.xcframework',
+        tarball: 'release/xcframeworks/RNSVG.tar.gz',
+        remoteKey: `react-native-svg/output/${VERSION_PREFIX}/release/xcframeworks/RNSVG.tar.gz`,
+      },
+      sharedSpmDeps: {
+        SVGNative: {
+          bases: [`${packageRoot}/prebuilds/spm-deps/SVGNative`],
+          debug: 'debug/SVGNative.xcframework',
+          release: 'release/SVGNative.xcframework',
+        },
+      },
+    });
+  });
+
+  it('prefers a custom modules path over the package-bundled directory', async () => {
+    const packageRoot = mockInternalPackage('expo-image', [
+      { name: 'ExpoImage', podName: 'ExpoImage' },
+    ]);
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, {
+      mode: 'app-plan',
+      customModulesPath: '/custom',
+    });
+
+    expect(document.ExpoImage?.artifact.bases).toEqual([
+      '/custom/expo-image/output',
+      `${packageRoot}/prebuilds/output`,
+    ]);
+  });
+
+  it('offers the monorepo build directory when running inside an expo checkout', async () => {
+    const packageRoot = mockInternalPackage(
+      'expo-image',
+      [{ name: 'ExpoImage', podName: 'ExpoImage', spmPackages: [{ productName: 'Lottie' }] }],
+      { inRepo: true }
+    );
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, { mode: 'app-plan' });
+
+    expect(document.ExpoImage?.artifact.bases).toEqual([
+      `${MONOREPO_BASE}/expo-image/output`,
+      `${packageRoot}/prebuilds/output`,
+    ]);
+    expect(document.ExpoImage?.artifact.sharedSpmDeps.Lottie?.bases).toEqual([
+      `${MONOREPO_BASE}/.spm-deps/Lottie`,
+      `${packageRoot}/prebuilds/spm-deps/Lottie`,
+    ]);
+  });
+
+  it('keeps the monorepo directory for shared SPM deps that a custom path replaces for products', async () => {
+    const packageRoot = mockInternalPackage(
+      'expo-image',
+      [{ name: 'ExpoImage', podName: 'ExpoImage', spmPackages: [{ productName: 'Lottie' }] }],
+      { inRepo: true }
+    );
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, {
+      mode: 'app-plan',
+      customModulesPath: '/custom',
+    });
+
+    expect(document.ExpoImage?.artifact.bases).toEqual([
+      '/custom/expo-image/output',
+      `${packageRoot}/prebuilds/output`,
+    ]);
+    expect(document.ExpoImage?.artifact.sharedSpmDeps.Lottie?.bases).toEqual([
+      '/custom/.spm-deps/Lottie',
+      `${MONOREPO_BASE}/.spm-deps/Lottie`,
+      `${packageRoot}/prebuilds/spm-deps/Lottie`,
+    ]);
+  });
+
+  it('never versions an internal product, whatever versions the caller supplies', async () => {
+    const packageRoot = mockInternalPackage('expo-image', [
+      { name: 'ExpoImage', podName: 'ExpoImage' },
+    ]);
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, {
+      mode: 'app-plan',
+      ...VERSIONS,
+    });
+
+    expect(document.ExpoImage?.artifact.bases).toEqual([`${packageRoot}/prebuilds/output`]);
+    expect(document.ExpoImage?.artifact.debug).not.toHaveProperty('remoteKey');
+  });
+
+  it('omits the remote key for internal products, which the store never holds', async () => {
+    mockInternalPackage('expo-image', [{ name: 'ExpoImage', podName: 'ExpoImage' }]);
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, { mode: 'app-plan' });
+
+    expect(document.ExpoImage?.artifact.release).not.toHaveProperty('remoteKey');
+  });
+
+  it('names artifacts after the product, not the pod', async () => {
+    mockInternalPackage('expo-image', [{ name: 'ExpoImageCore', podName: 'ExpoImage' }]);
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, { mode: 'app-plan' });
+
+    expect(document.ExpoImage?.artifact.debug.framework).toBe(
+      'debug/xcframeworks/ExpoImageCore.xcframework'
+    );
+  });
+
+  it('lets an explicit null custom path suppress the environment fallback', async () => {
+    const packageRoot = mockInternalPackage('expo-image', [
+      { name: 'ExpoImage', podName: 'ExpoImage' },
+    ]);
+    process.env.EXPO_PRECOMPILED_MODULES_PATH = '/from-env';
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, {
+      mode: 'app-plan',
+      customModulesPath: null,
+    });
+
+    expect(document.ExpoImage?.artifact.bases).toEqual([`${packageRoot}/prebuilds/output`]);
+  });
+
+  it('reads the environment fallback when the caller says nothing', async () => {
+    const packageRoot = mockInternalPackage('expo-image', [
+      { name: 'ExpoImage', podName: 'ExpoImage' },
+    ]);
+    process.env.EXPO_PRECOMPILED_MODULES_PATH = '/from-env';
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, { mode: 'app-plan' });
+
+    expect(document.ExpoImage?.artifact.bases).toEqual([
+      '/from-env/expo-image/output',
+      `${packageRoot}/prebuilds/output`,
+    ]);
+  });
+
+  it('prefixes each external package with its own version', async () => {
+    const svgRoot = mockExternalPackage('react-native-svg', [{ podName: 'RNSVG' }], {
+      iosVersion: '15.15.4',
+    });
+    const screensRoot = mockExternalPackage('react-native-screens', [{ podName: 'RNScreens' }], {
+      iosVersion: '4.26.0',
+    });
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, {
+      mode: 'app-plan',
+      ...VERSIONS,
+    });
+
+    const suffix = `${VERSIONS.reactNativeVersion}/${VERSIONS.hermesVersion}`;
+    expect(document.RNSVG?.artifact.bases).toEqual([
+      `${svgRoot}/prebuilds/output/15.15.4/${suffix}`,
+      `${svgRoot}/prebuilds/output`,
+    ]);
+    expect(document.RNSVG?.artifact.debug.remoteKey).toBe(
+      `react-native-svg/output/15.15.4/${suffix}/debug/xcframeworks/RNSVG.tar.gz`
+    );
+    expect(document.RNScreens?.artifact.bases).toEqual([
+      `${screensRoot}/prebuilds/output/4.26.0/${suffix}`,
+      `${screensRoot}/prebuilds/output`,
+    ]);
+    expect(document.RNScreens?.artifact.release.remoteKey).toBe(
+      `react-native-screens/output/4.26.0/${suffix}/release/xcframeworks/RNScreens.tar.gz`
+    );
+  });
+
+  it('falls back to the package manifest when the React Native config carries no ios version', async () => {
+    const packageRoot = mockExternalPackage('react-native-svg', [{ podName: 'RNSVG' }], {
+      manifestVersion: '15.15.4',
+    });
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, {
+      mode: 'app-plan',
+      ...VERSIONS,
+    });
+
+    expect(document.RNSVG?.artifact.bases).toEqual([
+      `${packageRoot}/prebuilds/output/${VERSION_PREFIX}`,
+      `${packageRoot}/prebuilds/output`,
+    ]);
+  });
+
+  it('prefers the React Native config version over the package manifest', async () => {
+    mockExternalPackage('react-native-svg', [{ podName: 'RNSVG' }], {
+      iosVersion: '15.15.4',
+      manifestVersion: '9.9.9',
+    });
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, {
+      mode: 'app-plan',
+      ...VERSIONS,
+    });
+
+    expect(document.RNSVG?.artifact.debug.remoteKey).toBe(
+      `react-native-svg/output/${VERSION_PREFIX}/debug/xcframeworks/RNSVG.tar.gz`
+    );
+  });
+
+  it.each([
+    ['the package version', {}, VERSIONS],
+    [
+      'the React Native version',
+      { iosVersion: PACKAGE_VERSION },
+      { ...VERSIONS, reactNativeVersion: undefined },
+    ],
+    [
+      'the Hermes version',
+      { iosVersion: PACKAGE_VERSION },
+      { ...VERSIONS, hermesVersion: undefined },
+    ],
+  ])('leaves an external product unversioned when %s is missing', async (_, pkg, versions) => {
+    const packageRoot = mockExternalPackage('react-native-svg', [{ podName: 'RNSVG' }], pkg);
+
+    const document = await resolvePrebuiltMetadataAsync(optionsLoader, {
+      mode: 'app-plan',
+      ...versions,
+    });
+
+    expect(document.RNSVG?.artifact.bases).toEqual([`${packageRoot}/prebuilds/output`]);
+    expect(document.RNSVG?.artifact.debug.remoteKey).toBe(
+      'react-native-svg/output/debug/xcframeworks/RNSVG.tar.gz'
+    );
+    expect(document.RNSVG?.artifact.release.remoteKey).toBe(
+      'react-native-svg/output/release/xcframeworks/RNSVG.tar.gz'
+    );
+  });
+});
+
 describe('resolvePrebuiltMetadataAsync', () => {
   beforeEach(() => {
     vol.reset();
@@ -206,6 +547,7 @@ describe('resolvePrebuiltMetadataAsync', () => {
               productName: 'RNWorkletsDep',
               version: { exact: '0.6.0' },
             },
+            { url: 'https://github.com/expo/rn-worklets-unpinned.git', productName: 'Unpinned' },
           ],
         },
         {
@@ -283,26 +625,22 @@ describe('resolvePrebuiltMetadataAsync', () => {
     expect(document.ExpoOddFloor).not.toHaveProperty('iosDeploymentTarget');
   });
 
-  // A precompiled product's SPM package dependencies ship as separate
-  // xcframeworks. Consumers cannot read the config that names them, so the
-  // document has to carry them. Mirrors Ruby's `spm_dependency_frameworks`.
-  it('publishes the SPM dependency products of an internal product', async () => {
-    const document = await resolvePrebuiltMetadataAsync(optionsLoader, { mode: 'app-plan' });
+  // A consumer linking a precompiled product's SPM packages as the XCFrameworks
+  // shipped beside it reads their product names from spmPackages. A second list
+  // of names could only disagree with it.
+  it.each([
+    ['an internal', 'ExpoSpmCoordinates', ['SDWebImage', 'libavif', 'Branchy', 'Pinned']],
+    ['an external', 'RNWorklets', ['RNWorkletsDep']],
+  ])(
+    'publishes the SPM packages of %s product as spmPackages alone',
+    async (_, podName, productNames) => {
+      const document = await resolvePrebuiltMetadataAsync(optionsLoader, { mode: 'app-plan' });
 
-    expect(document.ExpoWithDeps).toMatchObject({ spmDependencies: ['SDWebImage', 'libavif'] });
-  });
+      expect(document[podName]?.spmPackages?.map((pkg) => pkg.productName)).toEqual(productNames);
+      expect(document[podName]).not.toHaveProperty('spmDependencies');
+    }
+  );
 
-  it('publishes the SPM dependency products of an external product too', async () => {
-    const document = await resolvePrebuiltMetadataAsync(optionsLoader, { mode: 'app-plan' });
-
-    expect(document.RNWorklets).toMatchObject({ spmDependencies: ['RNWorkletsDep'] });
-  });
-
-  it('omits the dependencies of a product that declares none', async () => {
-    const document = await resolvePrebuiltMetadataAsync(optionsLoader, { mode: 'app-plan' });
-
-    expect(document.ExpoModulesCore).not.toHaveProperty('spmDependencies');
-  });
   // A source-emitted module declares its SwiftPM dependencies in the generated
   // manifest, which needs the whole coordinate — a product name alone resolves
   // to no package.
@@ -354,6 +692,7 @@ describe('resolvePrebuiltMetadataAsync', () => {
     expect(products).not.toContain('Floating');
     expect(products).not.toContain('Numeric');
     expect(products).not.toContain('Ambiguous');
+    expect(document.ExpoWithDeps).not.toHaveProperty('spmPackages');
   });
 
   // An empty string is a string, so the coordinate reads as present and renders
@@ -378,27 +717,33 @@ describe('resolvePrebuiltMetadataAsync', () => {
     expect(products).not.toContain('Renamed');
   });
 
-  // The framework-side field keeps its own meaning: it names the XCFrameworks
-  // shipped beside a precompiled product, whatever the coordinates say.
-  it('leaves spmDependencies listing the products of entries it skips', async () => {
-    const document = await resolvePrebuiltMetadataAsync(optionsLoader, { mode: 'app-plan' });
+  // CocoaPods links every entry that names a product, so an entry skipped here
+  // without a word links under CocoaPods and silently not under SwiftPM.
+  it.each([
+    ['ExpoSpmCoordinates', '"Floating"', 'no version requirement'],
+    ['ExpoSpmCoordinates', '"Numeric"', 'no version requirement'],
+    ['ExpoSpmCoordinates', '"Ambiguous"', 'no version requirement'],
+    ['ExpoSpmCoordinates', '"Renamed"', 'packageName'],
+    ['ExpoSpmCoordinates', '"Urlless"', 'no url'],
+    ['ExpoSpmCoordinates', 'spmPackages[9]', 'no productName'],
+    ['ExpoWithDeps', '"SDWebImage"', 'no url'],
+    ['ExpoWithDeps', 'spmPackages[1]', 'no productName'],
+    ['RNWorklets', '"Unpinned"', 'no version requirement'],
+  ])('warns once, naming %s and %s, about an SPM package it skips', async (podName, pkg, why) => {
+    await resolvePrebuiltMetadataAsync(optionsLoader, { mode: 'app-plan' });
 
-    expect(document.ExpoWithDeps).toMatchObject({ spmDependencies: ['SDWebImage', 'libavif'] });
-    expect(document.ExpoWithDeps).not.toHaveProperty('spmPackages');
-    expect(document.ExpoSpmCoordinates).toMatchObject({
-      spmDependencies: [
-        'SDWebImage',
-        'libavif',
-        'Branchy',
-        'Pinned',
-        'Floating',
-        'Numeric',
-        'Ambiguous',
-        'Renamed',
-        'Urlless',
-        '',
-      ],
-    });
+    const warnings = warningsAbout(podName).filter((message) => message.includes(pkg));
+    expect(warnings).toEqual([expect.stringContaining(why)]);
+    expect(warnings[0]).toMatch(/^\[prebuilt-metadata\] /);
+    expect(warnings[0]).toContain('spm.config.json');
+  });
+
+  it('warns about the entries it skips and no others', async () => {
+    await resolvePrebuiltMetadataAsync(optionsLoader, { mode: 'app-plan' });
+
+    expect(warningsAbout('ExpoSpmCoordinates')).toHaveLength(6);
+    expect(warningsAbout('ExpoWithDeps')).toHaveLength(3);
+    expect(warningsAbout('RNWorklets')).toHaveLength(1);
   });
 
   it('omits the coordinates of a product that declares none', async () => {

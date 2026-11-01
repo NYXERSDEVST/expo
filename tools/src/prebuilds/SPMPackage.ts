@@ -9,11 +9,12 @@ import fs from 'fs-extra';
 import { glob } from 'glob';
 import path from 'path';
 
-import { getPrecompileDir } from '../Directories';
+import { getExpoRepositoryRootDir } from '../Directories';
 import { getPackageByName } from '../Packages';
 import type { DownloadedDependencies } from './Artifacts.types';
 import {
   type CheckedInResolvedTarget,
+  getSiblingProductNames,
   isCheckedInResolvedTarget,
   resolveCheckedInManifestAsync,
   resolveCheckedInManifestRoot,
@@ -21,6 +22,7 @@ import {
 import type { SPMPackageSource } from './ExternalPackage';
 import { getExternalPackageByProductName } from './ExternalPackage';
 import { Frameworks } from './Frameworks';
+import { getPackageBuildDir } from './MonorepoLayout';
 import { getPackageLocalBuildPath, usesPackageLocalBuildPath } from './PackageLocalBuild';
 import { BuildFlavor } from './Prebuilder.types';
 import { ObjcTarget, SwiftTarget, CppTarget, SPMProduct } from './SPMConfig.types';
@@ -151,17 +153,16 @@ function getExpoModulesMacroPluginFlags(): string[] {
     throw new Error(
       `Could not locate the "expo-modules-core" package while generating Package.swift. ` +
         `The ExpoModules macros plugin executable (used to expand @OptimizedFunction etc.) ships ` +
-        `under "expo-modules-core/node_modules/@expo/expo-modules-macros-plugin/apple". ` +
+        `under "expo-modules-core/node_modules/expo-modules-macros/apple". ` +
         `Ensure expo-modules-core is installed in the workspace before running the prebuild.`
     );
   }
   const macrosToolPath = path.join(
     corePkg.path,
     'node_modules',
-    '@expo',
-    'expo-modules-macros-plugin',
+    'expo-modules-macros',
     'apple',
-    'ExpoModulesMacros-tool'
+    'ExpoModulesMacros'
   );
   _macroPluginFlagsCache = [
     '-Xfrontend',
@@ -1539,7 +1540,11 @@ async function buildPackageSwiftContext(
   let spinner = createAsyncSpinner(`Build Package Swift context`, pkg, product);
   const checkedInRoot = resolveCheckedInManifestRoot(pkg);
   const checkedInTargets = checkedInRoot
-    ? await resolveCheckedInManifestAsync(checkedInRoot, product)
+    ? await resolveCheckedInManifestAsync(
+        checkedInRoot,
+        product,
+        getSiblingProductNames(pkg, product)
+      )
     : null;
 
   // Get root directory for the Package.swift file
@@ -1622,7 +1627,7 @@ async function buildPackageSwiftContext(
       const depBuildPath =
         usesPackageLocalBuildPath(pkg) && dependencyPackage
           ? getPackageLocalBuildPath(dependencyPackage)
-          : path.join(getPrecompileDir(), '.build', packageName);
+          : getPackageBuildDir(getExpoRepositoryRootDir(), packageName);
       const xcframeworkPath = Frameworks.getFrameworkPath(depBuildPath, productName, buildType);
 
       if (await fs.pathExists(xcframeworkPath)) {
